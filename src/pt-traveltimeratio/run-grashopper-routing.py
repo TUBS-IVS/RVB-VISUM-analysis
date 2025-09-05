@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+import time
+import pickle
 import random
 from dataclasses import dataclass
 import argparse
@@ -50,7 +52,7 @@ def _repo_root() -> Path:
         if here.parent == here:
             break
         here = here.parent
-    raise RuntimeError("Konnte Repo-Root nicht finden (input/shapes/pt-data fehlt). Bitte Skript im Repo ausführen.")
+    raise RuntimeError("Could not find the repo root (input/shapes/pt-data missing). Please run this script from within the repository.")
 
 
 def _health_urls(port: int) -> Sequence[str]:
@@ -140,6 +142,14 @@ class RoutingMain:
     bbox: BBox = (10.45, 52.22, 10.60, 52.32)  # (min_lon, min_lat, max_lon, max_lat)
     src_epsg: str = "EPSG:25832"  # source CRS for endpoint points (ETRS89 / UTM zone 32N)
     auto_start: bool = False
+    # Reliability & caching
+    max_retries: int = 3
+    save_raw: bool = False
+    save_slices: bool = True
+    resume_slices: bool = True
+    # Selection strategy (default to shortest total itinerary time from GH)
+    selection_strategy: str = "gh_time"  # one of: walk_plus_pt, walk_pt_wait, gh_time
+    include_transfer_walk: bool = True
 
     def __post_init__(self):
         self.repo_root = _repo_root()
@@ -342,6 +352,15 @@ class RoutingMain:
 
         # 4) Iterate time slices from start_hour to end_hour
         print(f"Time slices to process: {len(time_slices)}")
+        # Prepare per-slice caching folder (optional resume)
+        date_compact = self.date.replace("-", "")
+        base_suffix = f"{self.start_hour:02d}-{self.end_hour:02d}_{self.interval_minutes}m"
+        test_tag = f"_test{self.test_limit}" if (self.test_limit is not None and self.test_limit > 0) else ""
+        slices_dir = self.output_dir / f"slices_{date_compact}_{base_suffix}{test_tag}"
+        try:
+            slices_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            print(f"Warning: could not create slices dir {slices_dir}: {e}")
         router = TransitRouter(port=self.gh_port)
         # optional GTFS lookup for route short names & modes
         gtfs_lookup = None
@@ -355,69 +374,122 @@ class RoutingMain:
                 f"Slice {idx}: OD pair count changed unexpectedly ({len(coords_list)} != {effective_pairs})"
             )
             print(f"[{idx}/{len(time_slices)}] Routing time slice {t} with {len(coords_list)} pairs...")
-            try:
-                results = asyncio.run(router.batch_pt_routes_safe(coords_list, departure_time=t))
-                print(f"  -> routes: {len(results)}")
-                # Convert results to flat OD DataFrame for this slice
-                df_slice = results_to_od_dataframe(results, gtfs_route_lookup=gtfs_lookup, coords_list=coords_list)
-                # Join with OD metadata to include relation attributes and connector indices
-                if not od_meta.empty:
-                    df_slice = df_slice.merge(od_meta, on="od_index", how="left")
-                df_slice["departure_time"] = t
-                # Build a readable OD id: O{origin_idx+1}_D{dest_idx+1}, fallback OD_{od_index+1}
+
+            # Prepare per-slice file names
+            sanitized_t = t.replace(":", "-")
+            slice_df_path = slices_dir / f"slice_{sanitized_t}.parquet"
+            slice_raw_path = slices_dir / f"slice_{sanitized_t}.pkl"
+
+            # Resume: load cached per-slice DataFrame if available and resume enabled
+            if getattr(self, "resume_slices", False) and slice_df_path.exists():
                 try:
-                    import numpy as np  # optional; used for isnan check
+                    df_slice = pd.read_parquet(slice_df_path)
+                    all_slices.append(df_slice)
+                    print(f"  -> loaded cached slice {slice_df_path.name}: {len(df_slice)} rows")
+                    continue
+                except Exception as e:
+                    print(f"  -> failed to load cached slice, will re-route ({e})")
+
+            # Retry loop for routing this slice
+            max_retries = getattr(self, "max_retries", 3) or 1
+            results = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    results = asyncio.run(router.batch_pt_routes_safe(coords_list, departure_time=t))
+                    break
+                except Exception as e:
+                    if attempt >= max_retries:
+                        print(f"  -> failed time slice {t} after {attempt} attempts: {e}")
+                        results = None
+                    else:
+                        delay = min(30, 2 * attempt)
+                        print(f"  -> attempt {attempt} failed: {e}  | retrying in {delay}s...")
+                        time.sleep(delay)
+
+            if results is None:
+                # Skip this slice
+                continue
+
+            print(f"  -> routes: {len(results)}")
+
+            # Optionally save raw results for debugging/resume
+            if getattr(self, "save_raw", False):
+                try:
+                    with open(slice_raw_path, "wb") as f:
+                        pickle.dump(results, f)
+                except Exception as e:
+                    print(f"  -> failed to save raw slice pickle: {e}")
+
+            # Convert results to flat OD DataFrame for this slice
+            df_slice = results_to_od_dataframe(
+                results,
+                gtfs_route_lookup=gtfs_lookup,
+                coords_list=coords_list,
+                walking_speed_mps=1.33,
+                selection_strategy=self.selection_strategy,
+                include_transfer_walk=self.include_transfer_walk,
+            )
+            # Join with OD metadata to include relation attributes and connector indices
+            if not od_meta.empty:
+                df_slice = df_slice.merge(od_meta, on="od_index", how="left")
+            df_slice["departure_time"] = t
+
+            # Build a readable OD id: O{origin_idx+1}_D{dest_idx+1}, fallback OD_{od_index+1}
+            try:
+                import numpy as np  # optional; used for isnan check
+            except Exception:
+                np = None  # type: ignore
+            def _mk_od_id(r):
+                oi = r.get("origin_endpoint_index")
+                di = r.get("destination_endpoint_index")
+                try:
+                    if oi is not None and di is not None and (np is None or (not np.isnan(oi) and not np.isnan(di))):
+                        return f"O{int(oi)+1}_D{int(di)+1}"
                 except Exception:
-                    np = None  # type: ignore
-                def _mk_od_id(r):
-                    oi = r.get("origin_endpoint_index")
-                    di = r.get("destination_endpoint_index")
-                    try:
-                        if oi is not None and di is not None and (np is None or (not np.isnan(oi) and not np.isnan(di))):
-                            return f"O{int(oi)+1}_D{int(di)+1}"
-                    except Exception:
-                        pass
-                    try:
-                        return f"OD_{int(r.get('od_index', 0))+1}"
-                    except Exception:
-                        return "OD_UNKNOWN"
-                df_slice["od_id"] = df_slice.apply(_mk_od_id, axis=1)
+                    pass
+                try:
+                    return f"OD_{int(r.get('od_index', 0))+1}"
+                except Exception:
+                    return "OD_UNKNOWN"
+            df_slice["od_id"] = df_slice.apply(_mk_od_id, axis=1)
 
-                # Drop geometry and connector endpoint list/count columns
-                drop_cols = [
-                    "origin_geometry", "destination_geometry",
-                    "connector_far_endpoints_o", "connector_far_endpoints_d",
-                    "n_connectors_o", "n_connectors_d",
-                ]
-                df_slice = df_slice.drop(columns=[c for c in drop_cols if c in df_slice.columns], errors="ignore")
+            # Drop geometry and connector endpoint list/count columns
+            drop_cols = [
+                "origin_geometry", "destination_geometry",
+                "connector_far_endpoints_o", "connector_far_endpoints_d",
+                "n_connectors_o", "n_connectors_d",
+            ]
+            df_slice = df_slice.drop(columns=[c for c in drop_cols if c in df_slice.columns], errors="ignore")
 
-                # Reorder columns so OD info appears first
-                preferred_order = [
-                    "od_index", "od_id",
-                    "origins", "destinations", "usage_rebus", "pt_transfers", "pt_trips",
-                    "origin_name", "destination_name",
-                    "origin_endpoint_index", "destination_endpoint_index",
-                    "row_id",
-                    "origin_lat", "origin_lon", "dest_lat", "dest_lon",
-                    "departure_time",
-                ]
-                present_first = [c for c in preferred_order if c in df_slice.columns]
-                remaining = [c for c in df_slice.columns if c not in present_first]
-                df_slice = df_slice[present_first + remaining]
-                all_slices.append(df_slice)
-                print(f"  -> df_slice rows: {len(df_slice)}; columns: {len(df_slice.columns)}")
-                # TODO: persist per-slice results if needed (e.g., Parquet/CSV)
-            except Exception as e:
-                print(f"  -> failed time slice {t}: {e}")
+            # Reorder columns so OD info appears first
+            preferred_order = [
+                "od_index", "od_id",
+                "origins", "destinations", "usage_rebus", "pt_transfers", "pt_trips",
+                "origin_name", "destination_name",
+                "origin_endpoint_index", "destination_endpoint_index",
+                "row_id",
+                "origin_lat", "origin_lon", "dest_lat", "dest_lon",
+                "departure_time",
+            ]
+            present_first = [c for c in preferred_order if c in df_slice.columns]
+            remaining = [c for c in df_slice.columns if c not in present_first]
+            df_slice = df_slice[present_first + remaining]
+            all_slices.append(df_slice)
+            print(f"  -> df_slice rows: {len(df_slice)}; columns: {len(df_slice.columns)}")
+
+            # Optionally persist per-slice results for resume
+            if getattr(self, "save_slices", False):
+                try:
+                    df_slice.to_parquet(slice_df_path, index=False)
+                except Exception as e:
+                    print(f"  -> failed to save slice parquet: {e}")
 
         # 5) Build final DataFrame from all slices
         if all_slices:
             df_all = pd.concat(all_slices, ignore_index=True)
             print(f"\nFinal results DataFrame: {df_all.shape[0]} rows, {df_all.shape[1]} columns across {len(time_slices)} slices.")
             # Persist final results as Parquet and CSV
-            date_compact = self.date.replace("-", "")
-            suffix = f"{self.start_hour:02d}-{self.end_hour:02d}_{self.interval_minutes}m"
-            test_tag = f"_test{self.test_limit}" if (self.test_limit is not None and self.test_limit > 0) else ""
+            suffix = base_suffix
             base_name = f"pt_routing_results_{date_compact}_{suffix}{test_tag}"
             parquet_path = self.output_dir / f"{base_name}.parquet"
             csv_path = self.output_dir / f"{base_name}.csv"
@@ -463,6 +535,15 @@ if __name__ == "__main__":
     parser.add_argument("--end-hour", type=int, default=22, help="End hour (0-23), default 22")
     parser.add_argument("--interval-minutes", type=int, default=15, help="Interval minutes, default 15")
     parser.add_argument("--test-limit", type=int, default=None, help="Limit number of OD pairs for test runs")
+    parser.add_argument("--max-retries", type=int, default=3, help="Max retries per time slice (default: 3)")
+    parser.add_argument("--no-save-slices", action="store_true", help="Do not save per-slice parquet outputs")
+    parser.add_argument("--no-resume", action="store_true", help="Do not resume from cached per-slice outputs")
+    parser.add_argument("--save-raw", action="store_true", help="Save raw API results (pickle) per slice for debugging")
+    parser.add_argument("--selection-strategy", type=str, default="gh_time",
+                        choices=["walk_plus_pt", "walk_pt_wait", "gh_time"],
+                        help="Best-option selection: gh_time (default, shortest total), walk_plus_pt, walk_pt_wait")
+    parser.add_argument("--exclude-transfer-walk", action="store_true",
+                        help="Ignore transfer walking distance for selection (only access/egress counted)")
     args = parser.parse_args()
 
     RoutingMain(
@@ -472,4 +553,10 @@ if __name__ == "__main__":
         end_hour=args.end_hour,
         interval_minutes=args.interval_minutes,
         test_limit=args.test_limit,
+        max_retries=args.max_retries,
+        save_slices=(not args.no_save_slices),
+        resume_slices=(not args.no_resume),
+        save_raw=args.save_raw,
+        selection_strategy=args.selection_strategy,
+        include_transfer_walk=(not args.exclude_transfer_walk),
     ).run()

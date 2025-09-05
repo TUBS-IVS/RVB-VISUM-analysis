@@ -126,7 +126,7 @@ class TransitRouter:
 
                 for attempt in range(1, max_retries + 1):
                     try:
-                        results = await self._run_batch(batch, departure_time)
+                        results = await self._run_batch(batch, departure_time)                    
                         if results is None or all(r is None for r in results):
                             raise RuntimeError("Batch returned only None results")
                         all_results.extend(results)
@@ -141,40 +141,4 @@ class TransitRouter:
                             await asyncio.sleep(2 * attempt)  # backoff
 
             return all_results
-    #no longer in use - remove
-    # def _parse_pt_response(self, path):
-    #     segments = path.get("legs", [])
-    #     first_station_name = None
-    #     first_station_coord = None
-    #
-    #     for seg in segments:
-    #         if seg.get("type") == "pt":
-    #             first_station_name = seg.get("departure_location")
-    #             first_station_coord = seg.get("geometry", {}).get("coordinates", [None, None])[0]
-    #             break
-    #
-    #     return {
-    #         "gh_time": path["time"] / 60000,  # ms to minutes
-    #         "distance": path["distance"],
-    #         "transfers": path.get("transfers", 0),
-    #         "segments": segments,
-    #         "first_station_name": first_station_name,
-    #         "first_station_coord": first_station_coord,
-    #         "pt_line_1": path.get("bus_1"),
-    #         "pt_line_2": path.get("bus_2"),
-    #         "pt_line_3": path.get("bus_3"),
-    #         "walking_distance": path.get("walking_distance"),
-    #         "true_travel_time": path.get("true_time")
-    #     }
-
-
-# === USAGE EXAMPLES ===
-# router = TransitRouter()
-# result = router.get_pt_route(52.267, 10.523, 52.280, 10.530)
-# print(result)
-
-# === BATCH USAGE ===
-# router = TransitRouter()
-# coords_list = [(start_lat, start_lon, end_lat, end_lon), (...), (...)]
-# results = asyncio.run(router.batch_pt_routes(coords_list))
-# print(results)
+    
