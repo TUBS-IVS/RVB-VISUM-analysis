@@ -1,0 +1,83 @@
+###############################################
+# OS / Editors
+###############################################
+.DS_Store
+Thumbs.db
+.vscode/
+*.code-workspace
+
+###############################################
+# Python
+###############################################
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+.build/
+pip-wheel-metadata/
+.cache/
+.mypy_cache/
+.pytype/
+.pytest_cache/
+.coverage*
+coverage.xml
+htmlcov/
+
+# Virtual envs
+.env
+.venv
+venv/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+###############################################
+# Project data directories
+# Keep folder structure, ignore contents
+###############################################
+input/**
+!input/.gitkeep
+output/**
+!output/.gitkeep
+
+###############################################
+# Safety: Large/binary artifacts (global)
+###############################################
+# Archives and installers
+*.zip
+*.7z
+*.rar
+*.gz
+*.bz2
+*.xz
+*.tar
+*.jar
+
+# Raster/imagery
+*.tif
+*.tiff
+*.img
+
+# Vector geodata (Shapefile parts, GeoPackage)
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.qpj
+*.gpkg
+
+# OSM/Graph data
+*.pbf
+
+# Dataframes / binary tables
+*.parquet
+*.feather
+*.pkl

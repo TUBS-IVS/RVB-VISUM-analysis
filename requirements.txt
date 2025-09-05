@@ -1,0 +1,9 @@
+networkx~=3.4
+geopandas
+pandas
+shapely~=2.0.6
+requests~=2.32.3
+tqdm~=4.67.1
+osmnx~=2.0.1
+numpy~=1.26.4
+scipy~=1.15.0
