@@ -129,9 +129,16 @@ def update_gtfs_path_in_config(cfg: AppConfig, gtfs_path: Path) -> None:
         data = yaml.safe_load(f) or {}
 
     data.setdefault("graphhopper", {})
-    # Set portable paths (use forward slashes)
-    data["graphhopper"]["gtfs.file"] = str(gtfs_path).replace("\\", "/")
-    data["graphhopper"]["graph.location"] = str(cfg.resolved_cache_dir).replace("\\", "/")
+    # Prefer project-root relative paths starting with 'input/' for portability
+    project_root = cfg.project_root
+    def _rel_to_root(p: Path) -> str:
+        try:
+            rel = p.relative_to(project_root)
+            return str(rel).replace("\\", "/")
+        except ValueError:
+            return str(p).replace("\\", "/")
+    data["graphhopper"]["gtfs.file"] = _rel_to_root(gtfs_path)
+    data["graphhopper"]["graph.location"] = _rel_to_root(cfg.resolved_cache_dir)
 
     with open(config_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(data, f, sort_keys=False)
