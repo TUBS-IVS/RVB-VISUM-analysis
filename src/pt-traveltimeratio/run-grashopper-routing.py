@@ -9,6 +9,8 @@ from dataclasses import dataclass
 import argparse
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
+import os
+import shutil
 
 import pandas as pd
 import requests
@@ -38,6 +40,60 @@ from results_processing import results_to_od_dataframe
 
 
 BBox = Tuple[float, float, float, float]  # (min_lon, min_lat, max_lon, max_lat)
+
+
+def _resolve_java_bin() -> Path:
+    """Resolve Java executable flexibly.
+    Order:
+      1) GH_JAVA_BIN env var
+      2) JAVA_HOME/bin/java
+      3) Common Windows installations (Eclipse Adoptium, AdoptOpenJDK, etc.)
+      4) PATH lookup
+      5) Fallback 'java'
+    Returns Path (may be 'java').
+    """
+    # 1) Explicit override
+    env = os.environ.get("GH_JAVA_BIN")
+    if env:
+        p = Path(env)
+        if p.exists():
+            return p
+    # 2) JAVA_HOME
+    java_home = os.environ.get("JAVA_HOME")
+    if java_home:
+        cand = Path(java_home) / "bin" / ("java.exe" if os.name == "nt" else "java")
+        if cand.exists():
+            return cand
+    # 3) Common Windows locations
+    if os.name == "nt":
+        candidates: List[Path] = []
+        pf_vars = [os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramW6432")]
+        patterns = [
+            "Eclipse Adoptium/jdk*/*/bin/java.exe",
+            "Eclipse Adoptium/jdk*/bin/java.exe",
+            "AdoptOpenJDK/jdk*/bin/java.exe",
+            "Java/jdk*/bin/java.exe",
+            "Zulu/zulu*/bin/java.exe",
+        ]
+        for base_str in pf_vars:
+            if not base_str:
+                continue
+            base = Path(base_str)
+            for pattern in patterns:
+                for match in base.glob(pattern):
+                    candidates.append(match)
+        if candidates:
+            def _sort_key(p: Path):
+                return str(p.parent)
+            best = sorted(candidates, key=_sort_key, reverse=True)[0]
+            if best.exists():
+                return best
+    # 4) PATH
+    which = shutil.which("java")
+    if which:
+        return Path(which)
+    # 5) Fallback symbolic
+    return Path("java")
 
 
 def _repo_root() -> Path:
@@ -166,6 +222,8 @@ class RoutingMain:
         return ans in ("y", "yes")
 
     def _start_backend(self) -> None:
+        java_bin = _resolve_java_bin()
+        print(f"Using Java binary: {java_bin}")
         cfg = AppConfig(
             project_root=self.repo_root,
             graphhopper_dir=self.graphhopper_dir,
@@ -176,8 +234,7 @@ class RoutingMain:
             gh_jar_path=self.graphhopper_dir / "graphhopper-web-10.2.jar",
             gh_cache_dir=self.graphhopper_dir / "graph-cache",
             gh_port=self.gh_port,
-            # Adjust java_bin if your JDK lives elsewhere
-            java_bin=Path(r"C:\Program Files\Eclipse Adoptium\jdk-21.0.3.9-hotspot\bin\java.exe"),
+            java_bin=java_bin,
             java_opts=["-Xms8g", "-Xmx110g"],
         )
         # This will update config.yml, start GH, and wait until ready
