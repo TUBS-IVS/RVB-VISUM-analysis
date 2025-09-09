@@ -146,7 +146,7 @@ class RoutingMain:
             gh_cache_dir=self.graphhopper_dir / "graph-cache",
             gh_port=self.gh_port,
             java_bin=java_bin,
-            java_opts=["-Xms8g", "-Xmx110g"],
+            java_opts=["-Xms16g", "-Xmx64g"],
         )
         run_grashopper(cfg)
 
