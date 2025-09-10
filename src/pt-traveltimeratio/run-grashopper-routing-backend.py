@@ -78,7 +78,7 @@ cfg = AppConfig(
     gh_cache_dir=graphhopper_dir / "graph-cache",
     gh_port=8989,
     java_bin=java_bin,
-    java_opts=["-Xms32g", "-Xmx110g"],
+    java_opts=["-Xms16g", "-Xmx56g"],
 )
 
 run_grashopper(cfg)

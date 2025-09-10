@@ -4,95 +4,27 @@ import asyncio
 import time
 import argparse
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Tuple
+import gzip
+import json
+from concurrent.futures import ThreadPoolExecutor
+import contextlib
 import os
-import shutil
+import logging
+from tqdm import tqdm
 
 import pandas as pd
-import numpy as np
-import requests
 
 from gtfs_routing.transit_router import TransitRouter
-from gtfs_routing.gtfs_setup import AppConfig, run_grashopper, GTFSRouteLookup
+from gtfs_routing.gtfs_setup import AppConfig, run_grashopper
 from results_processing import (
     results_to_dataframe_with_options,
     parse_graphhopper_response,
     select_best_path,
 )
 
-BBox = Tuple[float, float, float, float]
-
-
-def _resolve_java_bin() -> Path:
-    env = os.environ.get("GH_JAVA_BIN")
-    if env:
-        p = Path(env)
-        if p.exists():
-            return p
-    java_home = os.environ.get("JAVA_HOME")
-    if java_home:
-        cand = Path(java_home) / "bin" / ("java.exe" if os.name == "nt" else "java")
-        if cand.exists():
-            return cand
-    if os.name == "nt":
-        candidates: List[Path] = []
-        pf_vars = [os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramW6432")]
-        patterns = [
-            "Eclipse Adoptium/jdk*/*/bin/java.exe",
-            "Eclipse Adoptium/jdk*/bin/java.exe",
-            "AdoptOpenJDK/jdk*/bin/java.exe",
-            "Java/jdk*/bin/java.exe",
-            "Zulu/zulu*/bin/java.exe",
-        ]
-        for base_str in pf_vars:
-            if not base_str:
-                continue
-            base = Path(base_str)
-            for pattern in patterns:
-                for match in base.glob(pattern):
-                    candidates.append(match)
-        if candidates:
-            def _sort_key(p: Path):
-                return str(p.parent)
-            best = sorted(candidates, key=_sort_key, reverse=True)[0]
-            if best.exists():
-                return best
-    which = shutil.which("java")
-    if which:
-        return Path(which)
-    return Path("java")
-
-def _repo_root() -> Path:
-    cwd = Path.cwd().resolve()
-    here = cwd
-    for _ in range(8):
-        if (here / "input" / "shapes" / "pt-data").exists():
-            return here
-        if here.parent == here:
-            break
-        here = here.parent
-    raise RuntimeError("Could not find the repo root (input/shapes/pt-data missing). Please run this script from within the repository.")
-
-def _health_urls(port: int) -> Sequence[str]:
-    base = f"http://localhost:{port}"
-    return (f"{base}/health", f"{base}/actuator/health")
-
-def _is_backend_ready(port: int, timeout: float = 0.0) -> bool:
-    import time
-    end = time.time() + max(0.0, timeout)
-    while True:
-        for url in _health_urls(port):
-            try:
-                r = requests.get(url, timeout=2)
-                if r.status_code == 200:
-                    return True
-            except requests.RequestException:
-                pass
-        if timeout <= 0 or time.time() >= end:
-            return False
-        time.sleep(1.0)
+import routing_helpers as rh
 
 ############################################################
 # NEW WORKFLOW: schedule-driven routing                     #
@@ -118,22 +50,39 @@ class RoutingMain:
     schedule_file: Optional[str] = None     # explicit path to schedule parquet
     auto_start: bool = False                # start backend if not running
     scenario_name: str = "scenario_V10_2025"  # output/<scenario_name>
+    # new toggles for caching and outputs
+    cache_slices: bool = True                   # write per-slice parquet caches
+    output_parquet: bool = True                 # write final parquet outputs
+    output_csv: bool = False                    # write final csv outputs
+    phase: str = "both"                         # 'route', 'enrich', or 'both'
+    slice_batch_size: int = 250                 # routing chunk size per slice for progress updates
 
     def __post_init__(self):
-        self.repo_root = _repo_root()
+        self.repo_root = rh.repo_root()
         self.output_dir = self.repo_root / "output" / self.scenario_name
         self.input_dir = self.repo_root / "input"
         self.graphhopper_dir = self.input_dir / "graphhopper"
         self.gtfs_dir = self.input_dir / "gtfs-data" / "2025(V10)"
         self.gtfs_zip = self.gtfs_dir / "VM_RVB_Basisszenario2025_mDTicket_V10_init_LB GTFS_250827.zip"
         self.routes_txt = self.gtfs_dir / "routes.txt"
+        # per-slice cache directory
+        self.slice_cache_dir = self.output_dir / "slice_cache"
+        self.slice_cache_dir.mkdir(parents=True, exist_ok=True)
+        # raw cache for routing-only results (JSON.gz per slice)
+        self.raw_cache_dir = self.output_dir / "raw_cache"
+        self.raw_cache_dir.mkdir(parents=True, exist_ok=True)
 
-    def _prompt_start_backend(self) -> bool:
-        ans = input("GraphHopper backend is not running. Start it now? [y/N]: ").strip().lower()
-        return ans in ("y", "yes")
+    # ---------- cache path helpers ----------
+    def _raw_cache_path(self, departure_time: str) -> Path:
+        date_compact = self.date.replace('-', '')
+        t_safe = rh.sanitize_time_for_filename(departure_time)
+        base_suffix = f"{self.start_hour:02d}-{self.end_hour:02d}_{self.interval_minutes}m"
+        test_tag = f"_test{self.test_limit}" if (self.test_limit and self.test_limit > 0) else ""
+        base = f"slice_{date_compact}_{base_suffix}{test_tag}_{t_safe}"
+        return self.raw_cache_dir / f"{base}_raw.json.gz"
 
     def _start_backend(self) -> None:
-        java_bin = _resolve_java_bin()
+        java_bin = rh.resolve_java_bin()
         print(f"Using Java binary: {java_bin}")
         cfg = AppConfig(
             project_root=self.repo_root,
@@ -222,18 +171,20 @@ class RoutingMain:
         out = schedule[schedule['od_index'].isin(keep_od)].copy()
         return out
 
-    def run(self) -> None:
-        # Backend availability
-        if not _is_backend_ready(self.gh_port, timeout=2.0):
-            if self.auto_start:
-                print("Backend not running – starting GraphHopper...")
-                self._start_backend()
-            else:
-                print("Backend not running – please start manually or pass --auto-start (not implemented flag).")
-        else:
-            print(f"GraphHopper running on port {self.gh_port}.")
+    # ---------- per-slice cache helpers ----------
+    def _slice_cache_paths(self, departure_time: str) -> Tuple[Path, Path]:
+        date_compact = self.date.replace('-', '')
+        t_safe = rh.sanitize_time_for_filename(departure_time)
+        base_suffix = f"{self.start_hour:02d}-{self.end_hour:02d}_{self.interval_minutes}m"
+        test_tag = f"_test{self.test_limit}" if (self.test_limit and self.test_limit > 0) else ""
+        base = f"slice_{date_compact}_{base_suffix}{test_tag}_{t_safe}"
+        return (
+            self.slice_cache_dir / f"{base}_allpaths.parquet",
+            self.slice_cache_dir / f"{base}_fastest.parquet",
+        )
 
-        # Load schedule (full) then restrict for test limit
+    def run(self) -> None:
+        # Load schedule and derive slices
         full_schedule = self._load_schedule()
         print(f"Loaded schedule rows (full): {len(full_schedule)}")
         time_slices_full = self._unique_time_slices(full_schedule)
@@ -244,62 +195,157 @@ class RoutingMain:
         if self.test_limit:
             print(f"Applied test_limit -> rows now: {len(schedule)} (unique od_index: {restricted_unique_od})")
         time_slices = self._unique_time_slices(schedule)  # should match full
+        if not time_slices:
+            print("No time slices to process.")
+            return
         print(f"Time slices (used): {len(time_slices)} ({time_slices[0]} .. {time_slices[-1]})")
 
-        # Router + optional GTFS lookup
-        router = TransitRouter(port=self.gh_port)
-        try:
-            gtfs_lookup = GTFSRouteLookup(self.gtfs_zip)
-        except Exception as e:
-            print(f"Warning: GTFSRouteLookup failed ({e}); continuing without route info enrichment.")
-            gtfs_lookup = None
-
-        all_paths_rows: List[dict] = []
-        fastest_rows: List[pd.DataFrame] = []
-
-        # Timing / estimation helpers
-        routing_wall_start = time.time()
-        accumulated_routing_seconds = 0.0  # sum of pure routing calls
-        successful_requests = 0  # number of (od,slice) requests actually returned a result list (even empty paths)
-        expected_requests_restricted = restricted_unique_od * len(time_slices)
-        expected_requests_full = total_unique_od_full * len(time_slices_full)
-
+        # Common name parts
         date_compact = self.date.replace('-', '')
         base_suffix = f"{self.start_hour:02d}-{self.end_hour:02d}_{self.interval_minutes}m"
         test_tag = f"_test{self.test_limit}" if (self.test_limit and self.test_limit > 0) else ""
 
+        # Phase 1: ROUTING -> write raw JSON.gz per slice (resume if exists)
+        if self.phase in ("route", "both"):
+            # Backend availability only needed for routing
+            if not rh.is_backend_ready(self.gh_port, timeout=2.0):
+                if self.auto_start:
+                    print("Backend not running – starting GraphHopper...")
+                    self._start_backend()
+                else:
+                    print("Backend not running – please start manually or pass --auto-start.")
+            else:
+                print(f"GraphHopper running on port {self.gh_port}.")
+
+            router = TransitRouter(port=self.gh_port)
+            routing_wall_start = time.time()
+            accumulated_routing_seconds = 0.0
+            successful_requests = 0
+            expected_requests_restricted = restricted_unique_od * len(time_slices)
+            expected_requests_full = total_unique_od_full * len(time_slices_full)
+
+            # background writer for raw cache files
+            def _write_raw_cache(path: Path, results_obj) -> None:
+                with gzip.open(path, 'wt', encoding='utf-8') as f:
+                    json.dump(results_obj, f)
+
+            write_executor = ThreadPoolExecutor(max_workers=4)
+            write_futures: List[Tuple[object, Path]] = []  # (future, path)
+
+            # overall progress across slices (position 0) + persistent per-slice bar (position 1)
+            with tqdm(total=len(time_slices), desc="Slices", unit="slice", dynamic_ncols=True, position=0, leave=True) as pbar_slices:
+                pbar_slice = tqdm(total=0, desc="Slice -", unit="pair", dynamic_ncols=True, position=1, leave=True)
+                devnull = open(os.devnull, 'w')
+                try:
+                    for idx, t in enumerate(time_slices, start=1):
+                        raw_path = self._raw_cache_path(t)
+                        slice_df = schedule[schedule['departure_time'] == t].copy()
+                        if slice_df.empty:
+                            pbar_slices.update(1)
+                            continue
+                        if raw_path.exists():
+                            successful_requests += len(slice_df)
+                            pbar_slices.update(1)
+                            continue
+                        coords_list = list(zip(
+                            slice_df['origin_lat_wgs84'],
+                            slice_df['origin_lon_wgs84'],
+                            slice_df['dest_lat_wgs84'],
+                            slice_df['dest_lon_wgs84'],
+                        ))
+                        # configure per-slice progress bar
+                        pbar_slice.reset()
+                        pbar_slice.total = len(coords_list)
+                        pbar_slice.set_description(f"Slice {t}")
+                        pbar_slice.refresh()
+                        # chunk coords to allow progress updates
+                        results_all = []
+                        for start in range(0, len(coords_list), self.slice_batch_size):
+                            sub = coords_list[start:start + self.slice_batch_size]
+                            attempt = 0
+                            sub_results = None
+                            t0 = time.time()
+                            while attempt < self.max_retries:
+                                attempt += 1
+                                try:
+                                    # silence any print/log output from deep inside routing
+                                    old_disable = logging.root.manager.disable
+                                    logging.disable(logging.CRITICAL)
+                                    with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                                        sub_results = asyncio.run(router.batch_pt_routes_safe(sub, departure_time=t))
+                                    logging.disable(old_disable)
+                                    break
+                                except Exception:
+                                    logging.disable(old_disable if 'old_disable' in locals() else logging.NOTSET)
+                                    if attempt >= self.max_retries:
+                                        # give up on this chunk; still advance progress
+                                        break
+                                    delay = min(30, 2 * attempt)
+                                    pbar_slice.set_postfix_str(f"retry {attempt} in {delay}s")
+                                    time.sleep(delay)
+                            if sub_results is None:
+                                # still count progress to avoid stuck bar
+                                pbar_slice.update(len(sub))
+                                continue
+                            results_all.extend(sub_results)
+                            accumulated_routing_seconds += (time.time() - t0)
+                            successful_requests += len(sub)
+                            pbar_slice.update(len(sub))
+
+                        if not results_all:
+                            pbar_slices.update(1)
+                            continue
+                        # queue raw cache write (non-blocking)
+                        fut = write_executor.submit(_write_raw_cache, raw_path, results_all)
+                        write_futures.append((fut, raw_path))
+                        pbar_slices.update(1)
+                finally:
+                    try:
+                        devnull.close()
+                    except Exception:
+                        pass
+                    pbar_slice.close()
+
+            # Routing runtime estimation (when test subset)
+            if False and self.test_limit and restricted_unique_od < total_unique_od_full and successful_requests > 0:
+                # estimation prints disabled to keep bars clean
+                pass
+
+            # ensure all queued writes are finished before proceeding or exiting
+            if write_futures:
+                for fut, path in write_futures:
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        # keep bars clean; show minimal error hint in postfix
+                        pbar_slices.set_postfix_str(f"write error: {path.name}")
+                write_executor.shutdown(wait=False)
+
+            if self.phase == "route":
+                # keep output clean; bars reflect completion
+                return
+
+        # Phase 2: ENRICH -> read raw caches, write per-slice parquet (dataset), no single-file aggregation
+        slices_written = 0
+
         for idx, t in enumerate(time_slices, start=1):
+            raw_path = self._raw_cache_path(t)
             slice_df = schedule[schedule['departure_time'] == t].copy()
             if slice_df.empty:
                 continue
-            # Build coordinate list (lat, lon order expected by router)
-            coords_list = list(zip(
-                slice_df['origin_lat_wgs84'],
-                slice_df['origin_lon_wgs84'],
-                slice_df['dest_lat_wgs84'],
-                slice_df['dest_lon_wgs84'],
-            ))
-            print(f"[{idx}/{len(time_slices)}] Routing slice {t} -> {len(coords_list)} pairs")
-            # Retry loop
-            results = None
-            slice_route_start = time.time()
-            for attempt in range(1, self.max_retries + 1):
-                try:
-                    results = asyncio.run(router.batch_pt_routes_safe(coords_list, departure_time=t))
-                    break
-                except Exception as e:
-                    if attempt >= self.max_retries:
-                        print(f"  -> FAILED slice {t} after {attempt} attempts: {e}")
-                    else:
-                        delay = min(30, 2 * attempt)
-                        print(f"  -> attempt {attempt} error: {e} (retry in {delay}s)")
-                        time.sleep(delay)
-            if results is None:
+            if not raw_path.exists():
+                print(f"[{idx}/{len(time_slices)}] Missing raw cache for slice {t} -> {raw_path.name}; skipping.")
                 continue
-            slice_route_end = time.time()
-            accumulated_routing_seconds += (slice_route_end - slice_route_start)
-            successful_requests += len(coords_list)
-            # ---- All paths table ----
+            print(f"[{idx}/{len(time_slices)}] Enrich slice {t} from raw cache: {raw_path.name}")
+            try:
+                with gzip.open(raw_path, 'rt', encoding='utf-8') as f:
+                    results = json.load(f)
+            except Exception as e:
+                print(f"  -> raw cache read error ({raw_path.name}): {e}")
+                continue
+
+            # Build all-paths rows
+            slice_all_rows_local: List[dict] = []
             for local_idx, raw in enumerate(results):
                 if not raw:
                     continue
@@ -309,7 +355,6 @@ class RoutingMain:
                 meta_row = slice_df.iloc[local_idx]
                 for path_idx, p in enumerate(paths):
                     parsed = parse_graphhopper_response(p) or {}
-                    # Build route sequence for this path
                     route_sequence = []
                     has_pt_leg = False
                     for leg in (p.get('legs') or []):
@@ -320,7 +365,7 @@ class RoutingMain:
                                 route_sequence.append(str(rid))
                     if not has_pt_leg:
                         route_sequence = ['walk']
-                    all_paths_rows.append({
+                    row = {
                         'departure_time': t,
                         'slice_row_index': local_idx,
                         'od_index': meta_row.get('od_index'),
@@ -334,7 +379,6 @@ class RoutingMain:
                         'is_best': id(p) == best_id,
                         'path_index': path_idx,
                         'gh_time': parsed.get('gh_time'),
-                        # removed unreliable gh_distance per user request
                         'pure_pt_travel_time': parsed.get('pure_pt_travel_time'),
                         'total_walking_distance': parsed.get('total_walking_distance'),
                         'walking_dist_to_first_pt_station': parsed.get('walking_dist_to_first_pt_station'),
@@ -357,199 +401,52 @@ class RoutingMain:
                         'transfer_coords': parsed.get('transfer_coords'),
                         'transfer_wait_times': parsed.get('transfer_wait_times'),
                         'route_sequence': route_sequence,
-                    })
-            # ---- Fastest (with option lists) ----
+                    }
+                    slice_all_rows_local.append(row)
+            # no global accumulation; we only write per-slice parquet
+
+            # Fastest dataframe using helper
             fast_df = results_to_dataframe_with_options(
                 results,
                 slice_departure_time=t,
-                origin_lats=slice_df['origin_lat_wgs84'].values,
-                origin_lons=slice_df['origin_lon_wgs84'].values,
-                dest_lats=slice_df['dest_lat_wgs84'].values,
-                dest_lons=slice_df['dest_lon_wgs84'].values,
+                origin_lats= slice_df['origin_lat_wgs84'].values,
+                origin_lons= slice_df['origin_lon_wgs84'].values,
+                dest_lats= slice_df['dest_lat_wgs84'].values,
+                dest_lons= slice_df['dest_lon_wgs84'].values,
             )
-            # Re-map od_index to global; keep local position
             fast_df['slice_row_index'] = fast_df['od_index']
             fast_df['od_index'] = slice_df['od_index'].values
             if 'pair_id' in slice_df.columns:
                 fast_df['pair_id'] = slice_df['pair_id'].values
             fast_df['origin_endpoint_index'] = slice_df['origin_endpoint_index'].values
             fast_df['destination_endpoint_index'] = slice_df['destination_endpoint_index'].values
-            # carry coordinates
             if 'origin_lon_wgs84' in slice_df.columns:
                 fast_df['origin_lon_wgs84'] = slice_df['origin_lon_wgs84'].values
                 fast_df['origin_lat_wgs84'] = slice_df['origin_lat_wgs84'].values
                 fast_df['dest_lon_wgs84'] = slice_df['dest_lon_wgs84'].values
                 fast_df['dest_lat_wgs84'] = slice_df['dest_lat_wgs84'].values
             fast_df['departure_time'] = t
-            fastest_rows.append(fast_df)
+            # no global accumulation; we only write per-slice parquet
 
-        if not fastest_rows and not all_paths_rows:
-            print("No results produced.")
+            # write per-slice parquet caches during enrichment (optional)
+            if self.cache_slices:
+                path_all, path_fast = self._slice_cache_paths(t)
+                try:
+                    pd.DataFrame(slice_all_rows_local).to_parquet(path_all, index=False)
+                    fast_df.to_parquet(path_fast, index=False)
+                    slices_written += 1
+                    print(f"  -> cached slice parquet: {path_all.name}, {path_fast.name}")
+                except Exception as e:
+                    print(f"  -> slice cache error: {e}")
+
+        if slices_written == 0:
+            print("No per-slice parquet written in enrichment phase (missing raw caches or empty slices).")
             return
 
-        df_all_paths = pd.DataFrame(all_paths_rows)
-        df_fastest = pd.concat(fastest_rows, ignore_index=True) if fastest_rows else pd.DataFrame()
+        # Straight-line distance handled inside results_to_dataframe_with_options (no path/straight ratio kept).
 
-        print(f"All paths rows: {len(df_all_paths)} | Fastest rows: {len(df_fastest)}")
-
-    # Straight-line distance handled inside results_to_dataframe_with_options (no path/straight ratio kept).
-
-        # Estimation block (only when test_limit set and we processed subset)
-        if self.test_limit and restricted_unique_od < total_unique_od_full and successful_requests > 0:
-            wall_total = time.time() - routing_wall_start
-            # Use pure accumulated routing time for per-request average
-            per_request_seconds = accumulated_routing_seconds / successful_requests
-            estimated_total_seconds = per_request_seconds * expected_requests_full
-            remaining_seconds = max(0.0, estimated_total_seconds - accumulated_routing_seconds)
-
-            def _fmt(sec: float) -> str:
-                m, s = divmod(int(sec + 0.5), 60)
-                h, m = divmod(m, 60)
-                return f"{h:02d}:{m:02d}:{s:02d}"
-
-            print("\n=== Runtime Estimation (test mode) ===")
-            print(f"Processed unique OD pairs: {restricted_unique_od} / {total_unique_od_full} ({restricted_unique_od/total_unique_od_full:.2%})")
-            print(f"Time slices: {len(time_slices)}")
-            print(f"Successful routed requests (pairs * slices): {successful_requests} / {expected_requests_restricted}")
-            print(f"Accumulated routing call time: {_fmt(accumulated_routing_seconds)}")
-            print(f"Wall clock elapsed (includes overhead): {_fmt(wall_total)}")
-            print(f"Avg seconds per request (routing only): {per_request_seconds:.3f}s")
-            print(f"Estimated full requests: {expected_requests_full}")
-            print(f"Estimated total routing time (pure): {_fmt(estimated_total_seconds)}")
-            print(f"Estimated remaining (pure) if full run: {_fmt(remaining_seconds)}")
-
-        base_name_all = f"pt_routing_allpaths_{date_compact}_{base_suffix}{test_tag}"
-        base_name_fast = f"pt_routing_fastest_{date_compact}_{base_suffix}{test_tag}"
-
-        # Save
-        try:
-            df_all_paths.to_parquet(self.output_dir / f"{base_name_all}.parquet", index=False)
-            df_fastest.to_parquet(self.output_dir / f"{base_name_fast}.parquet", index=False)
-            print("Saved parquet outputs.")
-        except Exception as e:
-            print(f"Parquet save error: {e}")
-        try:
-            df_all_paths.to_csv(self.output_dir / f"{base_name_all}.csv", index=False)
-            df_fastest.to_csv(self.output_dir / f"{base_name_fast}.csv", index=False)
-            print("Saved CSV outputs.")
-        except Exception as e:
-            print(f"CSV save error: {e}")
-
-        # --- Summary stats ---
-        try:
-            print("\n=== Summary Metrics ===")
-            # Core counts
-            unique_od_processed = df_fastest['od_index'].nunique() if 'od_index' in df_fastest.columns else None
-            print(f"Unique OD pairs processed (fastest table): {unique_od_processed}")
-            print(f"Time slices processed: {len(time_slices)}")
-            # All-paths richness
-            if not df_all_paths.empty:
-                try:
-                    avg_paths_per_request = (
-                        df_all_paths.groupby(['od_index','departure_time']).size().mean()
-                    )
-                except Exception:
-                    avg_paths_per_request = None
-                print(f"Average alternative paths per request: {avg_paths_per_request:.2f}" if avg_paths_per_request is not None else "Average alternative paths per request: n/a")
-            # Numeric helpers
-            def _fmt_mean(df, col, factor=1.0, suffix=''):
-                if col in df.columns and not df[col].dropna().empty:
-                    return f"{df[col].mean():.2f}{suffix}" if factor == 1.0 else f"{(df[col].mean()/factor):.2f}{suffix}"
-                return "n/a"
-            # Travel times (seconds -> minutes)
-            avg_gh_min = _fmt_mean(df_fastest, 'gh_time', 60.0, ' min')
-            med_gh_min = (
-                f"{(df_fastest['gh_time'].median()/60.0):.2f} min" if 'gh_time' in df_fastest.columns and not df_fastest['gh_time'].dropna().empty else 'n/a'
-            )
-            # Avg pure PT travel time only for rows that actually used PT
-            if 'has_pt' in df_fastest.columns and 'pure_pt_travel_time' in df_fastest.columns:
-                mask_pt_time = df_fastest['has_pt'] == True
-                if mask_pt_time.any():
-                    avg_pt_travel_min = f"{(df_fastest.loc[mask_pt_time, 'pure_pt_travel_time'].mean()/60.0):.2f} min"
-                    med_pt_travel_min = f"{(df_fastest.loc[mask_pt_time, 'pure_pt_travel_time'].median()/60.0):.2f} min"
-                else:
-                    avg_pt_travel_min = "n/a"
-                    med_pt_travel_min = "n/a"
-            else:
-                avg_pt_travel_min = "n/a"
-                med_pt_travel_min = "n/a"
-            # Walking (split by mode usage) & transfers
-            if 'has_pt' in df_fastest.columns and 'total_walking_distance' in df_fastest.columns:
-                walk_col = 'total_walking_distance'
-                series_walk = df_fastest[walk_col]
-                # PT rows
-                mask_pt_rows = df_fastest['has_pt'] == True
-                if mask_pt_rows.any():
-                    avg_walk_dist_pt = f"{series_walk[mask_pt_rows].mean():.2f} m"
-                else:
-                    avg_walk_dist_pt = "n/a"
-                # Pure walk rows
-                mask_walk_only = df_fastest['has_pt'] == False
-                if mask_walk_only.any():
-                    avg_walk_dist_walk_only = f"{series_walk[mask_walk_only].mean():.2f} m"
-                else:
-                    avg_walk_dist_walk_only = "n/a"
-                # Overall (optional)
-                if not series_walk.dropna().empty:
-                    avg_walk_dist_overall = f"{series_walk.mean():.2f} m"
-                else:
-                    avg_walk_dist_overall = "n/a"
-            else:
-                avg_walk_dist_pt = avg_walk_dist_walk_only = avg_walk_dist_overall = "n/a"
-            avg_transfers = _fmt_mean(df_fastest, 'transfers')
-            # Average PT legs only among rows that actually used PT (exclude pure walk)
-            if 'has_pt' in df_fastest.columns and 'n_pt_legs' in df_fastest.columns and not df_fastest['n_pt_legs'].dropna().empty:
-                mask_pt = df_fastest['has_pt'] == True  # explicit True to avoid truthiness surprises
-                if mask_pt.any():
-                    avg_pt_legs = f"{df_fastest.loc[mask_pt, 'n_pt_legs'].mean():.2f}"
-                else:
-                    avg_pt_legs = "n/a"
-            else:
-                avg_pt_legs = "n/a"
-            # Share with PT
-            share_has_pt = (
-                f"{(df_fastest['has_pt'].mean()*100):.1f}%" if 'has_pt' in df_fastest.columns and not df_fastest['has_pt'].dropna().empty else 'n/a'
-            )
-            print(f"Avg total GH time (fastest)      : {avg_gh_min} (median {med_gh_min})")
-            print(f"Avg pure PT travel time          : {avg_pt_travel_min} (median {med_pt_travel_min})")
-            print(f"Avg total walking distance (all) : {avg_walk_dist_overall}")
-            print(f"Avg walking distance (PT rows)   : {avg_walk_dist_pt}")
-            print(f"Avg walking distance (walk-only) : {avg_walk_dist_walk_only}")
-            print(f"Avg transfers (fastest paths)    : {avg_transfers}")
-            # If derived number_of_transfers exists, report its mean similarly (PT only)
-            if 'number_of_transfers' in df_fastest.columns:
-                if 'has_pt' in df_fastest.columns:
-                    mask_pt2 = df_fastest['has_pt'] == True
-                    if mask_pt2.any():
-                        avg_number_transfers = f"{df_fastest.loc[mask_pt2, 'number_of_transfers'].mean():.2f}"
-                    else:
-                        avg_number_transfers = "n/a"
-                else:
-                    avg_number_transfers = f"{df_fastest['number_of_transfers'].mean():.2f}" if not df_fastest['number_of_transfers'].empty else 'n/a'
-                print(f"Avg derived transfers (best seq): {avg_number_transfers}")
-            # Circuity metrics
-            if 'straight_line_distance_m' in df_fastest.columns:
-                sld = df_fastest['straight_line_distance_m']
-                if not sld.dropna().empty:
-                    overall = sld.mean()
-                    print(f"Avg straight-line distance (all) : {overall:.2f} m")
-                    if 'has_pt' in df_fastest.columns:
-                        sld_pt = sld[df_fastest['has_pt'] == True]
-                        sld_walk = sld[df_fastest['has_pt'] == False]
-                        if not sld_pt.dropna().empty:
-                            print(f"  -> with PT                     : {sld_pt.mean():.2f} m")
-                        if not sld_walk.dropna().empty:
-                            print(f"  -> walk-only                   : {sld_walk.mean():.2f} m")
-            # Aggregate total transfer wait time
-            if 'total_transfer_wait_time' in df_fastest.columns:
-                mask_pt_wait = df_fastest['has_pt'] == True if 'has_pt' in df_fastest.columns else pd.Series([True]*len(df_fastest))
-                waits = df_fastest.loc[mask_pt_wait, 'total_transfer_wait_time'].dropna() if 'total_transfer_wait_time' in df_fastest.columns else pd.Series(dtype=float)
-                if not waits.empty:
-                    print(f"Avg total transfer wait (PT rows): {waits.mean():.2f} s (median {waits.median():.2f} s)")
-            print(f"Avg # PT legs (only PT rows)     : {avg_pt_legs}")
-            print(f"Share with any PT (has_pt)       : {share_has_pt}")
-        except Exception as e:
-            print(f"Summary metrics failed: {e}")
+        # Final note: per-slice parquet dataset is ready under slice_cache; read via glob/dataset
+        print(f"Per-slice parquet dataset ready under: {self.slice_cache_dir}")
 
         print("Done.")
         
@@ -565,7 +462,12 @@ if __name__ == "__main__":
     parser.add_argument("--test-limit", type=int, default=None, help="Limit number of unique od_index pairs")
     parser.add_argument("--max-retries", type=int, default=3, help="Retries per slice on failure")
     parser.add_argument("--save-raw", action="store_true", help="(Reserved) Save raw responses – currently ignored in new workflow")
+    # output format control
+    parser.add_argument("--output", choices=["parquet", "csv", "both"], default="parquet", help="Final output format(s)")
+    parser.add_argument("--phase", choices=["route", "enrich", "both"], default="both", help="Run only routing, only enrichment, or both")
     args = parser.parse_args()
+    out_parquet = args.output in ("parquet", "both")
+    out_csv = args.output in ("csv", "both")
 
     RoutingMain(
         gh_port=args.port,
@@ -578,4 +480,7 @@ if __name__ == "__main__":
         test_limit=args.test_limit,
         max_retries=args.max_retries,
         save_raw=args.save_raw,
+        output_parquet=out_parquet,
+        output_csv=out_csv,
+        phase=args.phase,
     ).run()
