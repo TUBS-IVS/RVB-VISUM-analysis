@@ -151,6 +151,8 @@ def run_grashopper(
     move_stops: Optional[List[Tuple[str, float, float]]] = None,
     add_stops: Optional[List[Tuple[str, float, float, str, Optional[str]]]] = None,
     remove_stops: Optional[List[str]] = None,
+    *,
+    quiet: bool = False,
 ) -> None:
     """
     Run GraphHopper for a scenario, with optional GTFS modifications.
@@ -240,21 +242,23 @@ def run_grashopper(
     gh.clear_cache()
 
     if gh.is_ready(timeout=3):
-        print(f"GraphHopper is already running on http://{gh.host}:{gh.port} (cache reused).")
+        if not quiet:
+            print(f"GraphHopper is already running on http://{gh.host}:{gh.port} (cache reused).")
     else:
-        print("Starting GraphHopper process...")
-        print(f"  JAR file   : {cfg.resolved_jar_path}")
-        print(f"  Config file: {cfg.gh_config_path}")
-        print(f"  Log file   : {log_path}")
-        gh.start(log_file=log_path)
+        if not quiet:
+            print("Starting GraphHopper process...")
+            print(f"  JAR file   : {cfg.resolved_jar_path}")
+            print(f"  Config file: {cfg.gh_config_path}")
+            print(f"  Log file   : {log_path}")
+        gh.start(log_file=log_path, quiet=quiet)
 
     # -------------------------------------------------------------------------
     # 5) Wait for readiness
     # -------------------------------------------------------------------------
     if not gh.wait_until_ready(timeout=1800):
         raise RuntimeError("GraphHopper did not become ready.")
-
-    print("GraphHopper is ready.")
+    if not quiet:
+        print("GraphHopper is ready.")
 
 
 # ==============================

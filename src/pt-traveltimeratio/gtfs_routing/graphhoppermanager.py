@@ -160,7 +160,12 @@ class GraphHopperManager:
         self.clear_cache()
         self.start()
 
-    def start(self, log_file: Optional[PathLike] = None, env: Optional[Dict[str, str]] = None) -> None:
+    def start(
+        self,
+        log_file: Optional[PathLike] = None,
+        env: Optional[Dict[str, str]] = None,
+        quiet: bool = False,
+    ) -> None:
         """
         Start the GraphHopper server using the configured Java command.
 
@@ -177,20 +182,24 @@ class GraphHopperManager:
         stderr_target = None
         file_handle = None
 
-        # Redirect logs to a file if requested
-        if log_file is not None:
+        # Quiet mode: send everything to DEVNULL unless a log_file is explicitly provided.
+        if quiet and log_file is None:
+            stdout_target = subprocess.DEVNULL
+            stderr_target = subprocess.DEVNULL
+        elif log_file is not None:
             log_path = Path(log_file)
             log_path.parent.mkdir(parents=True, exist_ok=True)
             file_handle = open(log_path, "a", encoding="utf-8")
             stdout_target = file_handle
             stderr_target = file_handle
 
-        print(f"Starting GraphHopper: {self._java_cmd}")
+        if not quiet:
+            print(f"Starting GraphHopper: {self._java_cmd}")
 
         proc = subprocess.Popen(
             self._java_cmd,
-            stdout=None,
-            stderr=None,
+            stdout=stdout_target,
+            stderr=stderr_target,
             env={**os.environ, **(env or {})},
             creationflags=0,
         )
@@ -199,7 +208,7 @@ class GraphHopperManager:
 
         # Close file handle in parent if we opened one
         if file_handle is not None:
-            # Keep the file descriptor open for the child, close only our handle
+            # Flush our handle; child process inherits descriptor.
             try:
                 file_handle.flush()
             except Exception:

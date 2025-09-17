@@ -2,6 +2,8 @@ from pathlib import Path
 import os
 import shutil
 from gtfs_routing.gtfs_setup import AppConfig, run_grashopper
+import socket
+import time
 
 
 def resolve_java_bin() -> Path:
@@ -60,6 +62,9 @@ def resolve_java_bin() -> Path:
 
 # Repository root (RVB-VISUM-analysis)
 root = Path(__file__).resolve().parents[2]
+# Ensure we run with repo root as working directory so relative paths inside GraphHopper config/logback remain valid
+os.chdir(root)
+print(f"Changed working directory to repo root: {root}")
 input_dir = root / "input"
 graphhopper_dir = input_dir / "graphhopper"
 gtfs_dir = input_dir / "gtfs-data" / "2025(V10)"
@@ -67,18 +72,55 @@ gtfs_dir = input_dir / "gtfs-data" / "2025(V10)"
 java_bin = resolve_java_bin()
 print(f"Using Java binary: {java_bin}")
 
-cfg = AppConfig(
-    project_root=root,
-    graphhopper_dir=graphhopper_dir,
-    gh_config_path=graphhopper_dir / "config.yml",
-    gtfs_input_zip=gtfs_dir / "VM_RVB_Basisszenario2025_mDTicket_V10_init_LB GTFS_250827.zip",
-    output_base=root / "output",
-    scenario_name="scenario_V10_2025",
-    gh_jar_path=graphhopper_dir / "graphhopper-web-10.2.jar",
-    gh_cache_dir=graphhopper_dir / "graph-cache",
-    gh_port=8989,
-    java_bin=java_bin,
-    java_opts=["-Xms16g", "-Xmx56g"],
-)
 
-run_grashopper(cfg)
+def _is_port_open(port: int, host: str = "127.0.0.1", timeout: float = 1.0) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def _wait_until_ready(port: int, host: str = "127.0.0.1", timeout: float = 180.0, poll: float = 2.0) -> bool:
+    start = time.time()
+    while time.time() - start < timeout:
+        if _is_port_open(port):
+            return True
+        time.sleep(poll)
+    return False
+
+
+if _is_port_open(8989):
+    print("GraphHopper already appears to be running on port 8989 – skipping start.")
+else:
+    cfg = AppConfig(
+        project_root=root,
+        graphhopper_dir=graphhopper_dir,
+        gh_config_path=(graphhopper_dir / "config.yml").resolve(),
+        gtfs_input_zip=(gtfs_dir / "VM_RVB_Basisszenario2025_mDTicket_V10_init_LB GTFS_250827.zip").resolve(),
+        output_base=(root / "output").resolve(),
+        scenario_name="scenario_V10_2025",
+        gh_jar_path=(graphhopper_dir / "graphhopper-web-10.2.jar").resolve(),
+        gh_cache_dir=(graphhopper_dir / "graph-cache").resolve(),
+        gh_port=8989,
+        java_bin=java_bin,
+        java_opts=[
+        "-Xms16g",
+        "-Xmx64g",
+        "-XX:+UseG1GC",
+        "-XX:MaxGCPauseMillis=200",
+        "-XX:ActiveProcessorCount=12",
+        "-Xss256k",
+        "-XX:ReservedCodeCacheSize=256m",
+        "-XX:MaxDirectMemorySize=512m",
+        "-Dlogging.level.root=ERROR",
+        "-Dlogging.level.com.graphhopper=ERROR",
+        "-Dlogging.level.org.springframework=ERROR",
+        ],
+    )
+    run_grashopper(cfg)
+    print("Waiting for GraphHopper to become ready...")
+    if _wait_until_ready(8989):
+        print("GraphHopper backend is ready.")
+    else:
+        print("Warning: GraphHopper did not open port 8989 within timeout.")

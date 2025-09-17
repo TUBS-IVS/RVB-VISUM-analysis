@@ -7,3 +7,6 @@ tqdm~=4.67.1
 osmnx~=2.0.1
 numpy~=1.26.4
 scipy~=1.15.0
+aiohttp>=3.10.0
+pyyaml>=6.0.0
+pyarrow>=14.0.0

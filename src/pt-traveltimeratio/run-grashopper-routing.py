@@ -13,6 +13,7 @@ import contextlib
 import os
 import logging
 from tqdm import tqdm
+import subprocess
 
 import pandas as pd
 
@@ -48,7 +49,7 @@ class RoutingMain:
     save_raw: bool = False                  # optionally pickle raw slice results
     resume_slices: bool = True              # reuse cached per-slice fastest/allpaths parquet (if future extension)
     schedule_file: Optional[str] = None     # explicit path to schedule parquet
-    auto_start: bool = False                # start backend if not running
+    auto_start: bool = True                # start backend if not running (also used for automatic restart)
     scenario_name: str = "scenario_V10_2025"  # output/<scenario_name>
     # new toggles for caching and outputs
     cache_slices: bool = True                   # write per-slice parquet caches
@@ -56,6 +57,7 @@ class RoutingMain:
     output_csv: bool = False                    # write final csv outputs
     phase: str = "both"                         # 'route', 'enrich', or 'both'
     slice_batch_size: int = 250                 # routing chunk size per slice for progress updates
+    quiet_backend: bool = True                  # suppress GraphHopper stdout/stderr
 
     def __post_init__(self):
         self.repo_root = rh.repo_root()
@@ -81,9 +83,35 @@ class RoutingMain:
         base = f"slice_{date_compact}_{base_suffix}{test_tag}_{t_safe}"
         return self.raw_cache_dir / f"{base}_raw.json.gz"
 
+    def _wait_for_backend(self, timeout: float = 180.0, poll: float = 2.0) -> bool:
+        """Poll until backend responds or timeout reached."""
+        start = time.time()
+        while time.time() - start < timeout:
+            if rh.is_backend_ready(self.gh_port, timeout=1.0):
+                return True
+            time.sleep(poll)
+        return False
+
     def _start_backend(self) -> None:
         java_bin = rh.resolve_java_bin()
         print(f"Using Java binary: {java_bin}")
+        cache_dir = self.graphhopper_dir / "graph-cache"
+        building = not cache_dir.exists()
+        print(f"Starting GraphHopper on port {self.gh_port} ... ({'quiet' if self.quiet_backend else 'verbose'} mode; {'initial build' if building else 'reuse cache'})")
+        # Silent logback (no console spam) if quiet mode
+        silent_logback = self.graphhopper_dir / "logback-silent.xml"
+        if self.quiet_backend and not silent_logback.exists():
+            silent_logback.write_text(
+                """<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<configuration>\n  <root level=\"ERROR\"/>\n</configuration>\n""",
+                encoding="utf-8",
+            )
+        java_opts = [
+            "-Xms16g","-Xmx64g","-XX:+UseG1GC","-XX:MaxGCPauseMillis=200","-XX:ActiveProcessorCount=12","-Xss256k",
+            "-XX:ReservedCodeCacheSize=256m","-XX:MaxDirectMemorySize=512m",
+            "-Dlogging.level.root=ERROR","-Dlogging.level.com.graphhopper=ERROR","-Dlogging.level.org.springframework=ERROR",
+        ]
+        if self.quiet_backend:
+            java_opts.append(f"-Dlogback.configurationFile={silent_logback.as_posix()}")
         cfg = AppConfig(
             project_root=self.repo_root,
             graphhopper_dir=self.graphhopper_dir,
@@ -95,9 +123,20 @@ class RoutingMain:
             gh_cache_dir=self.graphhopper_dir / "graph-cache",
             gh_port=self.gh_port,
             java_bin=java_bin,
-            java_opts=["-Xms16g", "-Xmx64g"],
+            java_opts=java_opts,
         )
-        run_grashopper(cfg)
+        # Delegate suppression to run_grashopper(quiet=...); still wrap in devnull to hide any stray prints
+        if self.quiet_backend:
+            with open(os.devnull, 'w') as devnull, contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                run_grashopper(cfg, quiet=True)
+        else:
+            run_grashopper(cfg, quiet=False)
+        timeout = 3600 if building else 300  # allow longer for initial import
+        print(f"Waiting for GraphHopper to become ready (timeout {timeout//60} min)...")
+        if self._wait_for_backend(timeout=timeout):
+            print("GraphHopper backend is ready.")
+        else:
+            print(f"Warning: GraphHopper did not open port {self.gh_port} within timeout.")
 
     # ---------- Schedule handling ----------
     def _expected_schedule_path(self) -> Path:
@@ -212,8 +251,12 @@ class RoutingMain:
                 if self.auto_start:
                     print("Backend not running – starting GraphHopper...")
                     self._start_backend()
+                    if not rh.is_backend_ready(self.gh_port, timeout=2.0):
+                        print("Backend still not reachable after start attempt. Aborting routing phase.")
+                        return
                 else:
                     print("Backend not running – please start manually or pass --auto-start.")
+                    return
             else:
                 print(f"GraphHopper running on port {self.gh_port}.")
 
@@ -275,16 +318,25 @@ class RoutingMain:
                                         sub_results = asyncio.run(router.batch_pt_routes_safe(sub, departure_time=t))
                                     logging.disable(old_disable)
                                     break
-                                except Exception:
+                                except Exception as e:
                                     logging.disable(old_disable if 'old_disable' in locals() else logging.NOTSET)
+                                    # Auto-restart logic
+                                    if self.auto_start and not rh.is_backend_ready(self.gh_port, timeout=1.0):
+                                        print(f"Routing batch failure (attempt {attempt}) - backend down? Restarting GraphHopper...")
+                                        self._start_backend()
+                                        if self._wait_for_backend():
+                                            print("Backend restarted and ready.")
+                                            # Re-create router instance (socket/session state may reset)
+                                            router = TransitRouter(port=self.gh_port)
+                                        else:
+                                            print("Backend restart timeout; will continue retries.")
                                     if attempt >= self.max_retries:
-                                        # give up on this chunk; still advance progress
+                                        print(f"Batch failed after {attempt} attempts: {e}")
                                         break
                                     delay = min(30, 2 * attempt)
                                     pbar_slice.set_postfix_str(f"retry {attempt} in {delay}s")
                                     time.sleep(delay)
                             if sub_results is None:
-                                # still count progress to avoid stuck bar
                                 pbar_slice.update(len(sub))
                                 continue
                             results_all.extend(sub_results)
@@ -462,9 +514,12 @@ if __name__ == "__main__":
     parser.add_argument("--test-limit", type=int, default=None, help="Limit number of unique od_index pairs")
     parser.add_argument("--max-retries", type=int, default=3, help="Retries per slice on failure")
     parser.add_argument("--save-raw", action="store_true", help="(Reserved) Save raw responses – currently ignored in new workflow")
-    # output format control
     parser.add_argument("--output", choices=["parquet", "csv", "both"], default="parquet", help="Final output format(s)")
     parser.add_argument("--phase", choices=["route", "enrich", "both"], default="both", help="Run only routing, only enrichment, or both")
+    # Replace old --auto-start flag with paired flags to keep default True
+    parser.add_argument("--auto-start", dest="auto_start", action="store_true", default=True, help="(default) Automatically start/restart backend if not running")
+    parser.add_argument("--no-auto-start", dest="auto_start", action="store_false", help="Disable automatic backend start/restart")
+    parser.add_argument("--no-quiet-backend", action="store_true", help="Do not suppress GraphHopper stdout/stderr")
     args = parser.parse_args()
     out_parquet = args.output in ("parquet", "both")
     out_csv = args.output in ("csv", "both")
@@ -483,4 +538,6 @@ if __name__ == "__main__":
         output_parquet=out_parquet,
         output_csv=out_csv,
         phase=args.phase,
+        auto_start=args.auto_start,
+        quiet_backend=not args.no_quiet_backend,
     ).run()
